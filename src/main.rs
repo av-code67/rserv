@@ -9,6 +9,7 @@ use std::fmt;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::time::{SystemTime, UNIX_EPOCH};
+use redis::{AsyncCommands, Client};
 
 const HOST: &str = "localhost:3000";
 
@@ -26,7 +27,7 @@ insert into links (token, link, \"start\", \"end\") values ($1, $2, $3, $4)
 ";
 
 const FIND_REDIRECT: &str = "
-select link from links where token=$1 and $2 between \"start\" and \"end\" limit 1
+select link, \"end\" from links where token=$1 and $2 between \"start\" and \"end\" limit 1
 ";
 
 #[tokio::main]
@@ -36,7 +37,9 @@ async fn main() {
         .connect("postgres://postgres:postgres@localhost/postgres").await.unwrap();
     sqlx::query(INIT_DB).execute(&pool).await.unwrap();
 
-    let state = AppState{pool: pool};
+    let redis_client = redis::Client::open("redis://localhost/").unwrap();
+
+    let state = AppState{pool: pool, redis: redis_client};
     let app = Router::new()
     .route("/", routing::post(new_shortcut_handler))
     .route("/{token}", routing::get(follow_shortcut_handler))
@@ -59,7 +62,8 @@ fn new_token() -> String {
 
 #[derive(Clone)]
 struct AppState {
-    pool: PgPool
+    pool: PgPool,
+    redis: Client
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -109,15 +113,27 @@ async fn new_shortcut_handler(State(state): State<AppState>, Json(payload): Json
 }
 
 async fn follow_shortcut_handler(State(state): State<AppState>, Path(token): Path<String>) -> Result<Redirect, StatusCode> {
+    let mut conn = state.redis.get_multiplexed_async_connection().await.unwrap();
+    let cached_redirect: Result<String, redis::RedisError> =  conn.get(&token).await;
+    if cached_redirect.is_ok() {
+        println!("Responded from cache token={}", &token);
+        return Ok(Redirect::temporary(cached_redirect.ok().unwrap().as_str()))
+    }
     let now = SystemTime::now();
     let duration_since_epoch = now
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards");
     let timestamp_secs = duration_since_epoch.as_secs() as i32;
-    let row: (String,) = sqlx::query_as(FIND_REDIRECT).persistent(true).bind(&token).bind(timestamp_secs).fetch_one(&state.pool).await.unwrap_or_default();
+    let row: (String, i32) = sqlx::query_as(FIND_REDIRECT).persistent(true).bind(&token).bind(timestamp_secs).fetch_one(&state.pool).await.unwrap_or_default();
     if row.0 == "" {
         Err(StatusCode::NOT_FOUND)
     } else {
+        let ttl = row.1 - timestamp_secs;
+        let set_cache: Result<String, redis::RedisError> = conn.set_ex(&token, &row.0,ttl as u64).await;
+        if set_cache.is_err() {
+            eprintln!("Failed to set token={}: {}", &token, set_cache.err().unwrap())
+
+        }
         Ok(Redirect::temporary(&row.0))
     }
 }
